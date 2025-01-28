@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -40,6 +40,7 @@ type Server struct {
 	node     *Node
 	server   *http.Server
 	storage  map[string]string
+	crashed  bool
 }
 
 var serverInstance *Server
@@ -57,6 +58,7 @@ func InitServer(node *Node) {
 		port:     addressParts[1],
 		node:     node,
 		storage:  make(map[string]string),
+		crashed:  false,
 	}
 
 	serverInstance.server = &http.Server{
@@ -77,7 +79,7 @@ func InitServer(node *Node) {
 	go startServerShutdownTimer(shutdownChan)
 
 	// Start the periodic finger table update
-	// go periodicUpdateFingerTable()
+	go periodicUpdateFingerTable()
 
 	// Wait for the shutdown signal
 	<-shutdownChan
@@ -104,13 +106,14 @@ func initMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/helloworld", helloworldHandler)
 	mux.HandleFunc("/storage/", storageHandler)
-	mux.HandleFunc("/getkeys", transferKeysHandler)
 	mux.HandleFunc("/network", networkHandler)
 	mux.HandleFunc("/node-info", nodeInfoHandler)
 	mux.HandleFunc("/leave", leaveHandler)
-	mux.HandleFunc("/sim-crash", simulateCrash)
-	mux.HandleFunc("/sim-recover", simulateRecover)
+	mux.HandleFunc("/sim-crash", simulateCrashHandler)
+	mux.HandleFunc("/sim-recover", simulateRecoverHandler)
 	mux.HandleFunc("/join", joinRingHandler)
+	mux.HandleFunc("/update-successor", updateSuccessorHandler)
+	mux.HandleFunc("/update-predecessor", updatePredecessorHandler)
 
 	return mux
 }
@@ -140,6 +143,7 @@ func startServerShutdownTimer(shutdownChan chan os.Signal) {
 }
 
 func (s *Server) findSuccessor(key int) *NodeAddress {
+
 	// First, check if the key falls between the current node and its immediate successor
 	if isBetweenInclusive(s.node.Id, key, s.node.SuccessorID.Id) {
 		return s.node.SuccessorID
@@ -154,10 +158,14 @@ func (s *Server) findSuccessor(key int) *NodeAddress {
 	}
 
 	// If no closer predecessor is found, return the successor as fallback
-	return s.node.FingerTable[len(s.node.FingerTable)-1].SuccessorID
+	return s.node.SuccessorID
 }
 
 func (s *Server) findClosestPredecessor(key int) *NodeAddress {
+
+	if s.node.FingerTable[0].SuccessorID == nil {
+		return s.node.SuccessorID
+	}
 
 	// Iterate through the finger table in reverse order
 	for i := len(s.node.FingerTable) - 1; i >= 0; i-- {
@@ -180,9 +188,9 @@ func (s *Server) findClosestPredecessor(key int) *NodeAddress {
 // Helper function to check if 'key' is in the interval (n1, n2] with wraparound handling
 func isBetweenInclusive(n1, key, n2 int) bool {
 	if n1 < n2 {
-		return key > n1 && key <= n2
+		return n1 < key && key <= n2
 	}
-	return key > n1 || key <= n2
+	return n1 < key || key <= n2
 }
 
 // Helper function to check if 'key' is in the interval (n1, n2) with wraparound handling
@@ -193,297 +201,17 @@ func isBetween(n1, key, n2 int) bool {
 	return key > n1 || key < n2
 }
 
-func get_keys_in_range(start, end int) []string {
-	keys := make([]string, 0)
-	for key, _ := range serverInstance.storage {
-		keyInt := hash(key)
-		fmt.Printf("Key: %s Hash: %d Start: %d End: %d\n", key, keyInt, start, end)
-		if isBetween(start, keyInt, end) {
-			keys = append(keys, key)
-		}
-	}
-	return keys
-}
-
-func transferKeysHandler(w http.ResponseWriter, r *http.Request) {
-
-	// Incomming node ID
-	nodeID := r.URL.Query().Get("nodeID")
-
-	if nodeID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	nodeIDInt, err := strconv.Atoi(nodeID)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	fmt.Printf("Transferring keys to node %d\n", nodeIDInt)
-
-	// Get the keys in the range of the given node
-	keys := get_keys_in_range(serverInstance.node.PredecessorID.Id, nodeIDInt)
-
-	fmt.Printf("Keys to transfer to %d: %v\n", nodeIDInt, keys)
-}
-
-// GET: Returns HTTP code 200, with value, if <key> exists in the DHT. Returns HTTP code 404, if <key> does not exist in the DHT.
-// PUT: Returns HTTP code 200. Assumed that <value> is persisted
-func storageHandler(w http.ResponseWriter, r *http.Request) {
-
-	s := serverInstance
-
-	if r.Method == "GET" {
-
-		key := strings.TrimPrefix(r.URL.Path, "/storage/")
-		keyInt := hash(key)
-
-		// Check if the key is within the valid range
-		if keyInt < 0 || keyInt >= 1<<keyIdentifierSpace || fmt.Sprintf("%T", keyInt) != "int" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		curr_node := s.node.Id
-		prev_node := s.node.PredecessorID.Id
-
-		if curr_node == prev_node {
-			_, ok := s.storage[key]
-			if ok {
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(s.storage[key]))
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		}
-
-		// Checking for wrap-around in the ring
-		if prev_node > curr_node {
-			if keyInt <= curr_node || keyInt > prev_node {
-
-				// Check local storage
-				value, ok := s.storage[key]
-				if ok {
-					w.WriteHeader(http.StatusOK)
-					w.Write([]byte(value))
-				} else {
-					w.WriteHeader(http.StatusNotFound)
-				}
-				return
-			}
-		} else if keyInt > prev_node && keyInt <= curr_node {
-			// If the key falls between the current node and its predecessor, return the value
-
-			value, ok := s.storage[key]
-			if ok {
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(value))
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		}
-
-		// Find the successor node for the given key
-		successor := s.findSuccessor(keyInt)
-
-		// If the successor is the current node, return the value
-		if successor.Address == s.node.Address {
-			value, ok := s.storage[key]
-			if ok {
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(value))
-			} else {
-				w.WriteHeader(http.StatusNotFound)
-			}
-			return
-		}
-
-		// Forward the request to the successor node
-		url := fmt.Sprintf("http://%s/storage/%s", successor.Address, key)
-
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Get(url)
-
-		if err != nil {
-			http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
-			return
-		}
-
-		// Handle the response
-		if resp.StatusCode == http.StatusOK {
-			body, err := io.ReadAll(resp.Body)
-
-			if err != nil {
-				http.Error(w, "Error reading response from successor node", http.StatusInternalServerError)
-				return
-			}
-
-			w.WriteHeader(http.StatusOK)
-			w.Write(body)
-
-		} else if resp.StatusCode == http.StatusNotFound {
-			w.WriteHeader(http.StatusNotFound)
-		} else {
-			http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
-		}
-		return
-
-	} else if r.Method == "PUT" {
-
-		key := strings.TrimPrefix(r.URL.Path, "/storage/")
-		keyInt := hash(key)
-
-		if keyInt < 0 || keyInt >= 1<<keyIdentifierSpace || fmt.Sprintf("%T", keyInt) != "int" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			fmt.Println("Error reading body:", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		defer r.Body.Close()
-
-		value := string(body)
-
-		curr_node := s.node.Id
-		prev_node := s.node.PredecessorID.Id
-
-		// If the current node is the only node in the ring, store the value
-		if prev_node == curr_node {
-			// Check local storage
-			_, ok := s.storage[key]
-			if ok {
-				w.WriteHeader(http.StatusForbidden)
-			} else {
-				// Store the value if the key is not already present
-				s.storage[key] = value
-				w.WriteHeader(http.StatusOK)
-			}
-			return
-		}
-
-		// Checking for wrap-around in the ring
-		if prev_node > curr_node {
-			if keyInt <= curr_node || keyInt > prev_node {
-
-				// Check local storage
-				_, ok := s.storage[key]
-				if ok {
-					w.WriteHeader(http.StatusForbidden)
-				} else {
-					// Store the value if the key is not already present
-					s.storage[key] = value
-					w.WriteHeader(http.StatusOK)
-				}
-				return
-			}
-		} else if keyInt > prev_node && keyInt <= curr_node {
-			// If the key falls between the current node and its predecessor, store the value
-			_, ok := s.storage[key]
-			// Store the value only if the key is not already present
-			if ok {
-				w.WriteHeader(http.StatusForbidden)
-			} else {
-				s.storage[key] = value
-				w.WriteHeader(http.StatusOK)
-			}
-			return
-		}
-
-		// Find the successor node for the given key
-		successor := s.findSuccessor(keyInt)
-
-		// If the successor is the current node, store the value
-		if successor.Address == s.node.Address {
-			_, ok := s.storage[key]
-			// Store the value only if the key is not already present
-			if ok {
-				w.WriteHeader(http.StatusForbidden)
-			} else {
-				s.storage[key] = value
-				w.WriteHeader(http.StatusOK)
-			}
-			return
-		}
-
-		// Forward the request to the successor node
-		url := fmt.Sprintf("http://%s/storage/%s", successor.Address, key)
-
-		// Forward the request to the given node
-		req, err := http.NewRequest("PUT", url, strings.NewReader(value))
-		if err != nil {
-			http.Error(w, "Error creating request", http.StatusInternalServerError)
-			return
-		}
-
-		// Set the content type and length
-		client := &http.Client{Timeout: 10 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
-			return
-		}
-		defer resp.Body.Close()
-
-		// Handle the response
-		if resp.StatusCode == http.StatusOK {
-			w.WriteHeader(http.StatusOK)
-			serverInstance.storage[key] = value
-		} else {
-			http.Error(w, "Error forwarding request to successor node", http.StatusInternalServerError)
-		}
-		return
-	}
-}
-
-// Returns HTTP code 200, with list of known nodes, as a JSON array of strings.
-func networkHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "GET" {
-		// Collect known node addresses into a list
-		nodes := make([]string, 0)
-		for _, node := range serverInstance.node.FingerTable {
-			nodes = append(nodes, node.SuccessorID.Address)
-		}
-
-		// Convert the list of node addresses to JSON
-		jsonData, err := json.Marshal(nodes)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Error encoding JSON"))
-			return
-		}
-
-		// Set content type and return the JSON data
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write(jsonData)
-	} else {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func helloworldHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	} else if r.Method == http.MethodGet {
-		w.WriteHeader(http.StatusOK)
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(serverInstance.hostname + ":" + serverInstance.port))
-	}
-}
-
 func (s *Server) create_info_interface() map[string]interface{} {
 	data := make(map[string]interface{})
+	data["id"] = s.node.Id
 	data["node_hash"] = s.node.Id
 	data["address"] = s.node.Address
+
+	if s.node.PredecessorID == nil {
+		data["predecessor"] = "nil"
+	} else {
+		data["predecessor"] = s.node.PredecessorID.Address
+	}
 
 	if s.node.SuccessorID == nil {
 		data["successor"] = "nil"
@@ -504,102 +232,6 @@ func (s *Server) create_info_interface() map[string]interface{} {
 	return data
 }
 
-func nodeInfoHandler(w http.ResponseWriter, r *http.Request) {
-
-	s := serverInstance
-
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-
-	} else if r.Method == http.MethodGet {
-
-		data := s.create_info_interface()
-
-		askingId := r.URL.Query().Get("successor")
-		if askingId != "" {
-			keyInt, err := strconv.Atoi(askingId)
-			key := "successor_of_" + strconv.Itoa(keyInt)
-
-			if err != nil || keyInt < 0 || keyInt >= 1<<keyIdentifierSpace {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-
-			curr_node := s.node.Id
-			prev_node := s.node.PredecessorID.Id
-			data[key] = s.node.Address
-
-			// If the current node is the only node in the ring, return it self
-			if curr_node == prev_node {
-				send_node_info(w, data)
-				return
-			}
-
-			// Checking for wrap-around in the ring
-			if prev_node > curr_node {
-				if keyInt <= curr_node || keyInt > prev_node {
-					send_node_info(w, data)
-					return
-				}
-			} else if keyInt > prev_node && keyInt <= curr_node {
-				// If the key falls between the current node and its predecessor, return the value
-				send_node_info(w, data)
-				return
-			}
-
-			successor := s.findSuccessor(keyInt)
-
-			// If the successor is the current node, return it self
-			if successor.Address == s.node.Address {
-				send_node_info(w, data)
-				return
-
-			} else {
-
-				// Forward the request to the successor node
-				url := fmt.Sprintf("http://%s/node-info?successor=%d", successor.Address, keyInt)
-
-				client := &http.Client{Timeout: 10 * time.Second}
-				resp, err := client.Get(url)
-
-				if err != nil {
-					http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
-					return
-				}
-
-				// Handle the response
-				if resp.StatusCode == http.StatusOK {
-
-					var successorData map[string]interface{}
-					decoder := json.NewDecoder(resp.Body)
-					err = decoder.Decode(&successorData)
-
-					if err != nil {
-						http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
-						return
-					}
-
-					data["address"] = successorData["address"]
-					data["successor"] = successorData["successor"]
-					data["others"] = successorData["others"]
-					data[key] = successorData[key]
-					send_node_info(w, data)
-
-				} else if resp.StatusCode == http.StatusNotFound {
-					w.WriteHeader(http.StatusNotFound)
-				} else {
-					http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
-				}
-			}
-			return
-		}
-
-		send_node_info(w, data)
-		return
-	}
-}
-
 func send_node_info(w http.ResponseWriter, data map[string]interface{}) {
 	jsonData, err := json.MarshalIndent(data, "", "\t")
 
@@ -609,8 +241,8 @@ func send_node_info(w http.ResponseWriter, data map[string]interface{}) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	w.Write(jsonData)
 }
 
@@ -624,6 +256,11 @@ func get_response(w http.ResponseWriter, url string) *http.Response {
 		return nil
 	}
 
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return nil
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		http.Error(w, "Error getting node info", http.StatusInternalServerError)
 		return nil
@@ -632,172 +269,280 @@ func get_response(w http.ResponseWriter, url string) *http.Response {
 	return resp
 }
 
-func joinRingHandler(w http.ResponseWriter, r *http.Request) {
+func put_request(w http.ResponseWriter, url string, jsonData []byte) *http.Response {
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPut, url, strings.NewReader(string(jsonData)))
+	if err != nil {
+		http.Error(w, "Error creating request", http.StatusInternalServerError)
+		return nil
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Error connecting to successor node", http.StatusInternalServerError)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "Error forwarding request to successor node", http.StatusInternalServerError)
+		return nil
+	}
+
+	return resp
+}
+
+// Additional functions
+
+func updateSuccessor(w http.ResponseWriter, address_from NodeAddress, address_to *NodeAddress) {
+	request := fmt.Sprintf("http://%s/update-successor", address_from.Address)
+	jsonData, err := json.Marshal(address_to)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Error encoding JSON"))
+		return
+	}
+
+	resp := put_request(w, request, jsonData)
+
+	if resp == nil {
+		return
+	}
+}
+
+func updatePredecessor(w http.ResponseWriter, address_from NodeAddress, address_to *NodeAddress) {
+	request := fmt.Sprintf("http://%s/update-predecessor", address_from.Address)
+	jsonData, err := json.Marshal(address_to)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Error encoding JSON"))
+		return
+	}
+
+	resp := put_request(w, request, jsonData)
+	if resp == nil {
+		return
+	}
+}
+
+func getNode(w http.ResponseWriter, address string) map[string]interface{} {
+	request := fmt.Sprintf("http://%s/node-info", address)
+	resp := get_response(w, request)
+
+	if resp == nil {
+		return nil
+	}
+
+	var data map[string]interface{}
+	decoder := json.NewDecoder(resp.Body)
+	err := decoder.Decode(&data)
+
+	if err != nil {
+		http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
+		return nil
+	}
+
+	return data
+}
+
+func periodicUpdateFingerTable() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		stabilize()
+		checkPredecessor()
+		updateFingerTable()
+	}
+}
+
+func stabilize() {
+
+	// Psudo code
+	// 1. x = successor.predecessor
+	// 2. if x is between current node and successor
+	// 3. 	successor = x
+	// 4. notify successor
 
 	s := serverInstance
 
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	successor := s.node.SuccessorID
+
+	// Get the predecessor of the successor node
+	request := fmt.Sprintf("http://%s/node-info?successor=%d", successor.Address, s.node.Id)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(request)
+
+	if err != nil {
 		return
+	}
 
-	} else if r.Method == http.MethodPost {
+	var data map[string]interface{}
+	decoder := json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
 
-		successorID := r.URL.Query().Get("nprime")
-		if successorID == "" {
-			w.WriteHeader(http.StatusBadRequest)
+	if err != nil {
+		return
+	}
+
+	request = fmt.Sprintf("http://%s/node-info", data["predecessor"].(string))
+	client = &http.Client{Timeout: 10 * time.Second}
+	resp, err = client.Get(request)
+
+	if err != nil {
+		return
+	}
+
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+
+	if err != nil {
+		return
+	}
+
+	predecessor := data
+
+	// Check if the predecessor of the successor node is between the current node and the successor
+	if isBetween(s.node.Id, int(predecessor["id"].(float64)), successor.Id) {
+		s.node.SuccessorID = &NodeAddress{
+			Id:      int(predecessor["id"].(float64)),
+			Address: predecessor["address"].(string),
+		}
+	}
+
+	// Notify the successor node
+	notify(successor.Address)
+}
+
+func updateFingerTable() {
+	// Psudo code
+	// next = next + 1
+	// if next > m
+	// 	next = 1
+	// finger[next].node = find_successor(n + 2^(next-1))
+
+	s := serverInstance
+
+	for i := 0; i < keyIdentifierSpace; i++ {
+
+		// Calculate the next finger entry
+		next := (s.node.Id + 1<<i) % (1 << keyIdentifierSpace)
+		finger := s.node.FingerTable[i]
+
+		successor := s.findSuccessor(next)
+
+		// Get the successor node for the next finger entry
+		url := fmt.Sprintf("http://%s/node-info?successor=%d", successor.Address, next)
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(url)
+
+		if err != nil || resp.StatusCode != http.StatusOK {
 			return
 		}
 
-		successorInfo := fmt.Sprintf("http://%s/node-info", successorID)
-		resp := get_response(w, successorInfo)
-		if resp == nil {
-			return
-		}
-
-		var successor map[string]interface{}
-		decoder := json.NewDecoder(resp.Body)
-		err := decoder.Decode(&successor)
-
-		if err != nil {
-			http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
-			return
-		}
-
-		// Sending a request to the successor node to get the node info
-		nodeInfo := fmt.Sprintf("http://%s/node-info?successor=%d", successorID, s.node.Id)
-		resp = get_response(w, nodeInfo)
-		if resp == nil {
-			return
-		}
-
-		// Decode the JSON response
 		var data map[string]interface{}
-		decoder = json.NewDecoder(resp.Body)
+		decoder := json.NewDecoder(resp.Body)
 		err = decoder.Decode(&data)
 
 		if err != nil {
-			http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
 			return
 		}
 
-		// Update the successor of the current node
-		key := "successor_of_" + strconv.Itoa(s.node.Id)
-		request := fmt.Sprintf("http://%s/node-info", data[key].(string))
-		resp = get_response(w, request)
-		if resp == nil {
-			return
+		key := "successor_of_" + strconv.Itoa(next)
+
+		node_address := ""
+		if data[key] == nil {
+			node_address = data["address"].(string)
+		} else {
+			node_address = data[key].(string)
 		}
 
-		var successorData map[string]interface{}
-		decoder = json.NewDecoder(resp.Body)
-		err = decoder.Decode(&successorData)
-
-		if err != nil {
-			http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
-			return
+		finger.SuccessorID = &NodeAddress{
+			Id:      int(data["id"].(float64)),
+			Address: node_address,
 		}
-
-		s.node.SuccessorID = &NodeAddress{
-			Id:      int(successorData["node_hash"].(float64)),
-			Address: successorData["address"].(string),
-		}
-
-		fmt.Printf("SUCCESSOR: %v\n", s.node.SuccessorID)
-
-		// Get keys from the storage from the successor node that should be transferred to the current node
-		// keys := make([]string, 0)
-
-		// Iterate through the storage of the successor node
-		request = fmt.Sprintf("http://%s/storage", s.node.SuccessorID.Address)
-		resp = get_response(w, request)
-		if resp == nil {
-			return
-		}
-
-		var storage map[string]string
-		decoder = json.NewDecoder(resp.Body)
-		err = decoder.Decode(&storage)
-
-		if err != nil {
-			http.Error(w, "Error decoding JSON", http.StatusInternalServerError)
-			return
-		}
-
-		fmt.Printf("STORAGE: %v\n", storage)
-
-		// // Iterate through the storage of the successor node
-		// for key, _ := range storage {
-		// 	keyInt := hash(key)
-		// 	if isBetween(s.node.Id, keyInt, s.node.SuccessorID.Id) {
-		// 		keys = append(keys, key)
-		// 	}
-		// }
 	}
 }
 
-// func periodicUpdateFingerTable() {
-// 	ticker := time.NewTicker(5 * time.Second)
-// 	defer ticker.Stop()
+func checkPredecessor() {
+	// Psudo code
+	// if predecessor has failed
+	// 	predecessor = nil
 
-// 	for range ticker.C {
-// 		fmt.Println("Updating Finger Table...")
-// 		updateFingerTable()
-// 	}
-// }
+	s := serverInstance
 
-// func updateFingerTable() {
-// 	// s := serverInstance
-// }
-
-// func (s *Server) updateFingerTable(node *NodeAddress, i int) {
-
-// 	// Check if the node is the immediate successor of the current node
-// 	if isBetween(s.node.Id, node.Id, s.node.FingerTable[i].SuccessorID.Id) {
-// 		s.node.FingerTable[i].SuccessorID = node
-
-// 		// Update the successor of the current node
-// 		if i == 0 {
-// 			s.node.SuccessorID = node
-// 		}
-
-// 		// Update the predecessor of the successor node
-// 		if i == len(s.node.FingerTable)-1 {
-// 			s.updatePredecessor(node)
-// 		}
-// 	}
-// }
-
-// func (s *Server) updatePredecessor(node *NodeAddress) {
-// 	// Check if the node is the immediate predecessor of the current node
-// 	if isBetween(s.node.PredecessorID.Id, node.Id, s.node.Id) {
-// 		s.node.PredecessorID = node
-// 	}
-// }
-
-func leaveHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	if s.node.PredecessorID == nil {
 		return
-	} else if r.Method == http.MethodPost {
-		// TODO: Implement leave handler
+	}
+
+	request := fmt.Sprintf("http://%s/node-info", s.node.PredecessorID.Address)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(request)
+
+	if err != nil {
+		s.node.PredecessorID = nil
+		return
+	}
+
+	// If the predecessor node has crashed, set the predecessor to nil
+	if resp.StatusCode != http.StatusOK {
+		s.node.PredecessorID = nil
+		return
+	}
+
+	var data map[string]interface{}
+	decoder := json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+
+	if err != nil {
+		s.node.PredecessorID = nil
+		return
+	}
+
+	if data["successor"] != s.node.Address {
+		s.node.PredecessorID = nil
 	}
 }
 
-func simulateCrash(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	} else if r.Method == http.MethodPost {
-		// TODO: Implement crash simulation
-	}
-}
+func notify(address string) {
+	// Psudo code
+	// if predecessor is nil or n' is between predecessor and n
+	// 	predecessor = n'
 
-func simulateRecover(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	s := serverInstance
+
+	request := fmt.Sprintf("http://%s/node-info", address)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(request)
+
+	if err != nil {
 		return
-	} else if r.Method == http.MethodPost {
-		// TODO: Implement recovery simulation
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var data map[string]interface{}
+	decoder := json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+
+	if err != nil {
+		return
+	}
+
+	if s.node.PredecessorID == nil || isBetween(s.node.PredecessorID.Id, int(data["id"].(float64)), s.node.Id) {
+		s.node.PredecessorID = &NodeAddress{
+			Id:      int(data["id"].(float64)),
+			Address: data["address"].(string),
+		}
 	}
 }
 
@@ -805,16 +550,13 @@ func createNewNode() {
 
 	// Creates a new id by hashing a random number
 	id := hash(strconv.Itoa(int(time.Now().UnixNano())))
-	for id == 0 || id == 4 || id == 8 || id == 12 {
-		id = hash(strconv.Itoa(int(time.Now().UnixNano())))
-	}
 
 	address := os.Args[3]
 	fingerTable := make([]*FingerEntry, keyIdentifierSpace)
 
 	for i := 0; i < keyIdentifierSpace; i++ {
 		fingerTable[i] = &FingerEntry{
-			Start:       -1,
+			Start:       int(math.Pow(2, float64(i))),
 			SuccessorID: nil,
 		}
 	}
